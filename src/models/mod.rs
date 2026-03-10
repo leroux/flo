@@ -10,6 +10,13 @@ pub struct Task {
     pub position: i64,
     pub created_at: String,
     pub updated_at: String,
+    pub deferred: bool,
+    pub review_interval: i64,
+    pub next_review_at: Option<String>,
+    pub acknowledged: bool,
+    pub focused: bool,
+    pub focused_at: Option<String>,
+    pub budget_minutes: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,6 +49,9 @@ pub struct UpdateTask {
     pub completed: Option<bool>,
     pub position: Option<i64>,
     pub parent_id: Option<String>,
+    pub deferred: Option<bool>,
+    pub acknowledged: Option<bool>,
+    pub focused: Option<bool>,
 }
 
 // ── Search ──
@@ -60,6 +70,7 @@ pub struct Sample {
     pub prompt_type: String,
     pub response: String,
     pub created_at: String,
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,8 +78,23 @@ pub struct CreateSample {
     pub response: String,
     #[serde(default = "default_prompt_type")]
     pub prompt_type: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 fn default_prompt_type() -> String {
     "activity".to_string()
+}
+
+// ── Mirror with task title (for display) ──
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SampleWithTask {
+    pub id: String,
+    pub prompt_type: String,
+    pub response: String,
+    pub created_at: String,
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
 }

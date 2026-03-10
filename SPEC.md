@@ -2,267 +2,307 @@
 
 ## Overview
 
-Flo is a task storage system with hierarchical frame navigation. Tasks are organized as a tree — every frame is a task, every task is a frame. The "current frame" is a cursor into the tree that determines what you see and work on.
+Flo is an executive function prosthetic — a hierarchical task manager with frame-based navigation, experience sampling, and spaced repetition review. Every frame is a task, every task is a frame.
 
-The system is designed for a neurodivergent/ADHD user who needs:
+Designed for a neurodivergent/ADHD user who needs:
 - Immediate context on open ("where was I?")
 - Focused view (only see children of current frame)
 - Low friction task capture and navigation
+- Honest feedback about where attention actually goes
 - Full queryability and editability by AI agents via API
 
-## Architecture ✅
+## Architecture
 
-- **Language:** Rust ✅
-- **Single crate** with modules: server, cli, tui, client, models, sync ✅
-- **Server:** Axum HTTP framework, REST API ✅
-- **Database:** SQLite via sqlx (async, compile-time checked queries) ✅
-- **CLI:** clap for arg parsing, reqwest for HTTP client ✅
-- **TUI:** ratatui for terminal UI, reqwest for HTTP client ✅
-- **Shared client:** Common API client library used by both CLI and TUI ✅
-- **Web UI:** Vite + React + TypeScript + Tailwind CSS ✅
+- **Language:** Rust
+- **Single crate** with modules: server, cli, tui, client, models, db, logging
+- **Server:** Axum HTTP framework, REST API
+- **Database:** SQLite via sqlx (async)
+- **CLI:** clap for arg parsing, reqwest for HTTP client
+- **TUI:** ratatui for terminal UI, reqwest for HTTP client
+- **Shared client:** Common `FloClient` library used by both CLI and TUI
 
-### Runtime Model ✅
+### Runtime Model
 
-The server runs as a persistent process. CLI and TUI are clients that talk to the server over HTTP.
+The server runs as a persistent background daemon. CLI and TUI are clients that talk to the server over HTTP. Server auto-starts on first CLI/TUI command if not running, with version checking and auto-restart on binary update.
 
 ```
-flo server        -- start API server                    ✅
-flo <command>     -- CLI commands (talk to server)       ✅
-flo tui           -- launch interactive TUI (talks to server)  ✅
+~/.flo/
+├── flo.db           # SQLite database
+├── cursor           # current frame ID (or empty for root)
+└── server.pid       # daemon process ID
 ```
 
 ## Data Model
 
-### Task (the only entity) ✅
+### tasks
 
-| Field       | Type     | Description                              | Status |
-|-------------|----------|------------------------------------------|--------|
-| id          | TEXT PK  | Unique identifier                        | ✅ |
-| parent_id   | TEXT FK  | Parent task ID (NULL for root)           | ✅ |
-| title       | TEXT     | Task title                               | ✅ |
-| notes       | TEXT     | Free-form notes (markdown)               | ✅ |
-| completed   | BOOL     | Whether the task is done                 | ✅ |
-| position    | INTEGER  | Sort order among siblings                | ✅ |
-| today       | BOOL     | Flagged for today's work                 | ✅ |
-| created_at  | TEXT     | ISO 8601 timestamp                       | ✅ |
-| updated_at  | TEXT     | ISO 8601 timestamp                       | ✅ |
+```sql
+CREATE TABLE tasks (
+    id              TEXT PRIMARY KEY NOT NULL,   -- ULID
+    parent_id       TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+    title           TEXT NOT NULL,
+    notes           TEXT NOT NULL DEFAULT '',
+    completed       BOOLEAN NOT NULL DEFAULT FALSE,
+    position        INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,               -- RFC 3339
+    updated_at      TEXT NOT NULL,               -- RFC 3339
+    deferred        BOOLEAN NOT NULL DEFAULT FALSE,
+    review_interval INTEGER NOT NULL DEFAULT 7,  -- days
+    next_review_at  TEXT                         -- RFC 3339, nullable
+);
+```
 
-Tree structure via parent pointer. Root tasks have `parent_id = NULL`.
+Tree structure via parent pointer. Root tasks (`parent_id = NULL`) are projects. `ON DELETE CASCADE` removes subtrees. ULID-based IDs are sortable and distributed-friendly.
 
-Multiple root-level tasks are allowed (separate projects/areas of life).
+### samples (experience sampling)
 
-### Cursor ✅
+```sql
+CREATE TABLE samples (
+    id          TEXT PRIMARY KEY NOT NULL,   -- ULID
+    prompt_type TEXT NOT NULL,               -- "activity", "ping"
+    response    TEXT NOT NULL,
+    created_at  TEXT NOT NULL                -- RFC 3339
+);
+```
 
-| Field       | Type     | Description                              |
-|-------------|----------|------------------------------------------|
-| id          | TEXT PK  | Cursor identifier (e.g. "default")       |
-| task_id     | TEXT FK  | Currently focused task                   |
+### Cursor
 
-Single cursor for now. Multiple cursors (per-agent) can be added later without schema changes.
+Local file `~/.flo/cursor` containing a single task ID (or empty for root). Not in the database — each client manages its own cursor.
 
-Note: CLI/TUI use a local file cursor (~/.flo/cursor) instead of the DB cursor table. Web UI manages frame state client-side.
+## Task Lifecycle
 
-### History ❌
+There are two independent axes to a task's state:
 
-| Field       | Type     | Description                              |
-|-------------|----------|------------------------------------------|
-| id          | INTEGER PK | Auto-increment                         |
-| action      | TEXT     | Action type (e.g. "task.created")        |
-| task_id     | TEXT     | Related task ID                          |
-| detail      | TEXT     | Human-readable description               |
-| snapshot    | TEXT     | JSON snapshot for undo (nullable)        |
-| created_at  | TEXT     | ISO 8601 timestamp                       |
+**Commitment** (do I intend to do this?)
+- **Captured** — brain-dumped, no decision made yet
+- **Committed** — deliberate acceptance: "I'm going to do this"
+- **Abandoned** — deleted from the system
 
-## Frame Navigation ✅
+**Temporal** (when?)
+- **Active** — on the workbench right now
+- **Queued** — committed but waiting its turn
+- **Deferred** — consciously parked, hidden from default views, surfaced on a spaced repetition schedule
+- **Done** — completed, hidden from default views
 
-The frame concept is the primary view. Your "current frame" determines what you see: the current task's title, notes, and its children.
+```
+capture ──→ focus ──→ touch ──→ touch ──→ done
+  │           ↑          │
+  │           │          └──→ (dimming: "you're not working on this")
+  │           │
+  │           └── unfocus (remove from slot, no state change)
+  │
+  └──→ defer ──→ review ──→ focus / snooze / done / kill
+```
 
-### Commands ✅
+**Touch** is an event, not a state — "I worked on this" resets the staleness clock without changing any state. Any task mutation (edit, reorder, add child, toggle done) implicitly touches by updating `updated_at`.
 
-| Command                   | Description                                      | Status |
-|---------------------------|--------------------------------------------------|--------|
-| `push <title>`            | Create child task under current frame, move into it | ✅ |
-| `pop`                     | Move to parent frame                             | ✅ |
-| `up`                      | Move to parent frame (alias)                     | ✅ |
-| `down <index\|id>`        | Move into a child frame                          | ✅ |
-| `top`                     | Move to root (clear cursor)                      | ✅ |
-| `switch <id>`             | Jump to any task by ID                           | ✅ (TUI/Web via search) |
-| `status`                  | Show current frame: title, notes, children       | ✅ |
-| `tree`                    | Show full tree from current frame down            | ✅ |
+## Staleness Dimming
 
-### Completed Task Visibility ✅
+Tasks in the TUI dim based on time since last `updated_at`:
 
-- Completed tasks are hidden from default frame view and tree display ✅
-- `--all` flag shows completed tasks ✅ (CLI --all, TUI/Web toggle)
-- Completed tasks remain in the tree, not moved or deleted ✅
-- History log separately records completion events ❌
+| Age       | Appearance                    |
+|-----------|-------------------------------|
+| < 3 days  | Full brightness               |
+| 3–7 days  | Slightly dimmed (rgb 160)     |
+| 7–14 days | Dimmer (rgb 120)              |
+| 14+ days  | Very dim (rgb 80)             |
 
-## Today's Tasks (partial)
+Completed tasks keep their existing crossed-out style regardless of age.
 
-Tasks can be flagged for "today." This is the subset that syncs to Todoist and represents your daily focus.
+Dimming measures **evidence of work**, not claims or intent. A task that's been focused but never touched still dims — that's a valuable signal.
 
-| Command                   | Description                                      | Status |
-|---------------------------|--------------------------------------------------|--------|
-| `today`                   | List today's tasks                               | ❌ (no dedicated endpoint/command) |
-| `today add <id>`          | Flag a task for today                            | ✅ (via PATCH today flag) |
-| `today remove <id>`       | Unflag a task from today                         | ✅ (via PATCH today flag) |
-| `today clear`             | Clear all today flags                            | ❌ |
+## Defer & Spaced Repetition Review
 
-Selection is manual. AI agent integration for auto-suggesting today's tasks is future work.
+### Defer
 
-## Task CRUD ✅
+Toggle a task between active and deferred. Deferred tasks are hidden from default views (list and tree) in both CLI and TUI.
 
-| Command                   | Description                                      | Status |
-|---------------------------|--------------------------------------------------|--------|
-| `add <title>`             | Create child task under current frame             | ✅ |
-| `edit <id> --title <t>`   | Update task title                                | ✅ |
-| `edit <id> --notes <n>`   | Update task notes                                | ✅ |
-| `complete <id>`           | Mark task as completed                           | ✅ |
-| `uncomplete <id>`         | Mark task as not completed                       | ✅ |
-| `delete <id>`             | Delete task and all descendants                  | ✅ |
-| `move <id> --before <id>` | Reorder task among siblings                      | ✅ (via position swap) |
-| `move <id> --into <id>`   | Reparent task                                    | ✅ |
+- CLI: `flo defer [index]`
+- TUI: `z` to toggle defer, `Z` to toggle showing deferred tasks
+- Deferred tasks show a `[zzz]` indicator when visible
+
+On defer: `next_review_at` is set to `now + review_interval` (default 7 days).
+On undefer: `review_interval` resets to 7 days, `next_review_at` clears.
+
+### Review
+
+`flo review` surfaces deferred tasks where `next_review_at <= now`. Interactive prompt for each:
+
+- **keep** — undefer, bring back to active, reset interval to 7d
+- **snooze** — double the review interval (7d → 14d → 28d → 56d → 90d cap), push out next review
+- **done** — mark complete
+- **quit** — stop reviewing
+
+Tasks you keep snoozing fade out of your review cycle. Tasks you engage with stay active.
+
+## Mirror (Experience Sampling)
+
+Self-reported attention tracking. Not automated — works for all of life, not just the computer.
+
+- `flo log <text>` — log what you're doing right now
+- `flo ping` — interactive "what are you doing?" prompt
+- `flo mirror` — show today's samples as a timeline
+
+The gap between what the task tree says you should be doing and what ESM says you're actually doing is where insight lives.
+
+## Frame Navigation
+
+The "current frame" is a cursor into the task tree that determines what you see and work on.
+
+| Command        | Description                                    |
+|----------------|------------------------------------------------|
+| `flo`          | Home view: list projects with next-action preview |
+| `flo status`   | Current frame: title, notes, children          |
+| `flo push <t>` | Create child + enter it                        |
+| `flo pop / up` | Move to parent                                 |
+| `flo down <N>` | Enter child N (1-based)                        |
+| `flo top`      | Go to root                                     |
+| `flo tree`     | Full tree from current frame                   |
+
+## Task CRUD
+
+| Command              | Description                        |
+|----------------------|------------------------------------|
+| `flo add <title>`    | Create child without entering it   |
+| `flo done [N]`       | Toggle done (current or child N)   |
+| `flo edit <N> <t>`   | Rename child N                     |
+| `flo delete <N>`     | Delete child N (cascades)          |
+| `flo note [text]`    | View or set notes on current frame |
+| `flo indent <N>`     | Make child N a subtask of sibling above |
 
 ## REST API
 
-All endpoints return JSON.
+All endpoints return JSON. Server on `127.0.0.1:4242` (configurable via `--port`).
 
-### Tasks ✅
-
-```
-GET    /api/tasks                  -- list root tasks (or children of ?parent_id=)     ✅
-GET    /api/tasks/:id              -- get task with children                            ✅
-GET    /api/tasks/:id/subtree      -- get full subtree (optional ?depth=N)              ✅
-POST   /api/tasks                  -- create task {parent_id, title, notes?, position?} ✅
-PATCH  /api/tasks/:id              -- update task {title?, notes?, completed?, position?, parent_id?, today?}  ✅
-DELETE /api/tasks/:id              -- delete task and descendants                       ✅
-```
-
-### Frame Navigation (Cursor) ❌
+### Tasks
 
 ```
-GET    /api/cursor                 -- get current frame
-PUT    /api/cursor                 -- set current frame {task_id}
-POST   /api/cursor/push            -- create child + move cursor {title}
-POST   /api/cursor/pop             -- move cursor to parent
-POST   /api/cursor/up              -- move cursor to parent
-POST   /api/cursor/down            -- move cursor to child {task_id}
-POST   /api/cursor/top             -- clear cursor (root view)
+GET    /api/tasks                  -- list children (root or ?parent_id=X)
+GET    /api/tasks/:id              -- get task with children
+GET    /api/tasks/:id/subtree      -- get full subtree
+GET    /api/tasks/:id/ancestors    -- get ancestor chain
+POST   /api/tasks                  -- create {parent_id?, title, notes?}
+PATCH  /api/tasks/:id              -- update {title?, notes?, completed?, position?, parent_id?, deferred?}
+DELETE /api/tasks/:id              -- delete + cascade
 ```
 
-Note: CLI/TUI use local file cursor instead. Web UI manages frame client-side. These server-side cursor endpoints are not implemented.
-
-### Today ❌
+### Defer & Review
 
 ```
-GET    /api/today                  -- list today's tasks
-POST   /api/today/:id              -- flag task for today
-DELETE /api/today/:id              -- unflag task from today
-DELETE /api/today                  -- clear all today flags
+POST   /api/tasks/:id/defer       -- toggle defer (returns updated task)
+POST   /api/tasks/:id/snooze      -- double review interval, push next_review_at
+GET    /api/review                 -- list deferred tasks due for review
 ```
 
-Note: Today flag is toggled via `PATCH /api/tasks/:id {today: true/false}` instead. Dedicated endpoints not implemented.
-
-### Search ❌
+### Search
 
 ```
-GET    /api/search?q=<query>       -- full-text search across titles and notes
+GET    /api/search?q=<query>       -- search titles and notes (LIKE, top 30)
 ```
 
-Note: Client-side search implemented in TUI and Web UI (loads all tasks, filters locally). No server-side FTS5.
-
-### History ❌
+### Home & Health
 
 ```
-GET    /api/history                -- list recent actions (optional ?limit=N)
+GET    /api/home                   -- project previews with pending counts
+GET    /api/health                 -- {status, version}
 ```
 
-### Undo/Redo ❌
+### Mirror
 
 ```
-POST   /api/undo                   -- undo last action
-POST   /api/redo                   -- redo last undone action
-GET    /api/undo/status            -- {can_undo: bool, can_redo: bool}
+POST   /api/samples               -- create sample {response, prompt_type?}
+GET    /api/samples                -- list today's samples
 ```
 
-## Undo/Redo ❌
+## TUI
 
-All mutations go through a single choke point. Before each mutation, a snapshot is captured for undo.
-
-- Snapshot-based (store previous state as JSON)
-- Max 50 undo steps
-- Redo stack cleared on new mutation
-
-## Search ❌ (server-side)
-
-Full-text search across task titles and notes. SQLite FTS5 extension for efficient searching.
-
-Note: Client-side fuzzy search works in TUI and Web UI.
-
-## TUI ✅
-
-Interactive terminal UI built with ratatui. Keyboard-first design.
+Interactive terminal UI. Vim-style keybindings. See USAGE.md for full keymap.
 
 Key features:
-- Tree view of tasks from current frame ✅
-- Navigate with arrow keys / vim bindings ✅
-- Inline task creation and editing ✅
-- Toggle completed task visibility ✅
-- Today's tasks view ✅ (flag toggle, no dedicated view)
-- Command palette for quick actions ✅ (search/move modals)
-- Status bar showing current frame breadcrumb ✅
+- Tree and list view toggle
+- Notes panel (side-by-side with task list)
+- Staleness dimming
+- Defer toggle with `[zzz]` indicator
+- Multi-select with bulk operations
+- Cut/yank/paste with undo/redo
+- Inline search (global) and filter (local)
+- Mouse support (click, scroll)
 
-## Web UI ✅ (not in original spec)
+## Planned: Touch
 
-React SPA with Vite dev server, full feature parity with TUI:
-- Tree view with DFS-ordered nesting ✅
-- All keyboard shortcuts matching TUI ✅
-- Search modal, move/reparent modal ✅
-- Detail panel with notes autosave ✅
-- Breadcrumb navigation ✅
+Explicit "I worked on this" action. Resets `updated_at` (undims) without changing any other state.
 
-## Sync (Stubbed)
+- CLI: `flo touch [N]`
+- TUI: `.` keystroke
+- Creates a sample linked to the task (bridges ESM — see below)
 
-Bidirectional sync with Todoist (or other todo apps).
+Touch is the evidence counterpart to focus (which is a claim). The system measures evidence, not claims.
 
-Scope: push tasks flagged as "today" to a Todoist project. Sync completions back.
+## Planned: Focus Slots
 
-Design:
-- Sync trait/interface defined now, implementation deferred
-- Mapping table: flo task ID <-> external task ID
-- Last-write-wins conflict resolution (with timestamps)
-- Sync triggered manually or on a timer
+N persistent cursors (N=3) representing what you're actively working on. Distinct from the navigational cursor — focus persists while you navigate freely.
 
-### Sync Mapping Table (future)
+- Pinned in a TUI header area, always visible
+- WIP limit enforced (can't focus more than N things)
+- Focus does NOT auto-refresh `updated_at` — a focused task still dims if you don't touch it
+- Staleness color varies by context: unfocused tasks dim gray (benign decay), focused tasks go warm toward red/amber ("you said this matters and you're not doing it")
 
-| Field         | Type     | Description                            |
-|---------------|----------|----------------------------------------|
-| task_id       | TEXT FK  | Flo task ID                        |
-| provider      | TEXT     | e.g. "todoist"                         |
-| external_id   | TEXT     | ID in external system                  |
-| synced_at     | TEXT     | Last sync timestamp                    |
+### ESM-Task Linking
 
-## AI Agent Integration (Future)
+Touch and focus connect the task tree to ESM:
 
-Flo will be drivable by AI agents via the REST API. For deeper integration (autonomous planning, task breakdown, daily suggestions), a minimal Rust port of [claudewire](reference/claudewire) will be needed.
+- `samples` table gets a nullable `task_id` foreign key
+- Touch = create sample with `task_id` set + refresh `updated_at`
+- `flo log` = create sample with free text, no task_id
+- `flo ping` could show focus slots as context ("you're focused on X, Y — is that what you're doing?")
+- `flo mirror` becomes a unified timeline of task-linked and free-text entries
 
-Claudewire wraps the Claude Code CLI's `--output-format stream-json` protocol into a programmable interface. A Rust subset would provide:
-- Stream-JSON protocol types (serde models for all message types)
-- ProcessConnection trait (async trait for managing CLI subprocess)
-- BridgeTransport (connects process to typed event stream)
-- Permission policies (composable allow/deny rules for tool use)
+### Data Model Changes
 
-This enables Flo's server to spawn and manage Claude Code sessions directly — e.g. an agent that reviews your task tree each morning and suggests today's focus, or an autonomous agent that works through its own task subtree.
+```sql
+ALTER TABLE tasks ADD COLUMN focused BOOLEAN NOT NULL DEFAULT FALSE;
+-- CHECK constraint: max N rows with focused = TRUE
 
-Full claudewire reference: `reference/claudewire/`
+ALTER TABLE samples ADD COLUMN task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+```
+
+## Planned: Inbox / Commit Distinction
+
+Tasks currently enter the system as implicitly committed. A future distinction:
+
+- **Inbox** — captured but not yet decided on. Lower visual weight.
+- **Committed** — deliberately accepted. Full visual weight.
+
+An ack action (entering the task, or a deliberate keystroke) moves inbox → committed. Unacked tasks could have a subtle visual marker.
+
+## Planned: Time Budgets
+
+Focus slots get an optional time budget. When you focus on something, you can say how long: "1h", "2h", "this morning." Flo nudges you when the budget runs out — not a hard stop, just a check-in: "you've been on X for 2h, you planned 1h. Keep going or switch?"
+
+- Budget is per focus-slot session, not per task globally
+- Notifications via text, Discord, or phone call (see Notifications below)
+- Over-budget is a signal, not a punishment — you can acknowledge and continue
+- ESM pings during a focused session include budget context ("45min left on X")
+
+This addresses the "wrong thing" failure mode: spending hours on something that felt productive but wasn't important. The intervention happens at the right moment — when you're deep in flow and have lost track of time.
+
+## Planned: Notifications & Reachout
+
+Push-based system for nudges, ESM pings, and budget alerts. Multiple channels:
+
+- **Text (SMS)** — ESM pings, budget alerts, review reminders
+- **Discord (Axi bot)** — integrated as a conversational interface in a channel you already live in
+- **Phone call** — escalation for critical nudges (e.g. 2x over budget, haven't responded to pings)
+
+Notifications are bidirectional — you can respond inline (text back, reply in Discord) to log ESM samples, snooze, or switch focus without opening the app.
 
 ## Future Work
 
-- **Multi-agent access:** Namespacing or permissioning so different AI agents get scoped access to different trees. API token-based auth.
-- **Additional views:** Flat list, kanban board, calendar — different lenses over the same task tree.
-- **Task statuses:** Beyond completed/not-completed (backlog, in-progress, blocked, cancelled).
-- **Repeating tasks:** Interval-based, completion-based, or cycle-based recurrence. Open question on how repeats interact with the tree.
-- **AI integration via claudewire:** Rust port of claudewire for driving Claude Code sessions. Claude Code SDK for auto-suggesting today's tasks, breaking down tasks, autonomous agent workflows.
-- **Notifications:** Push-based reminders (offloaded to AI agent for now).
-- **Due dates, priority, labels/tags:** Additional task fields as needed.
-- **Export/import:** Full data export as JSON for backup and migration.
+- **AI co-pilot:** Task suggestions, decomposition, pattern analysis from ESM data, accountability reflection
+- **Morning/evening ritual:** Daily intention setting and reflection
+- **History/audit log:** Server-side action log with snapshots for undo
+- **Multi-agent access:** Scoped API access for different AI agents
+- **Additional views:** Kanban, calendar, flat list
+- **Notifications:** Push-based reminders
+- **Sync:** Bidirectional sync with external todo apps
+- **Phone client:** ESM pings, quick status, AI chat

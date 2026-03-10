@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, patch, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -31,6 +31,13 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/tasks/{id}", get(get_task).patch(update_task).delete(delete_task))
         .route("/tasks/{id}/subtree", get(get_subtree))
         .route("/tasks/{id}/ancestors", get(get_ancestors))
+        .route("/tasks/{id}/defer", post(defer_task_route))
+        .route("/tasks/{id}/snooze", post(snooze_task))
+        .route("/tasks/{id}/touch", post(touch_task_route))
+        .route("/tasks/{id}/ack", post(ack_task_route))
+        .route("/tasks/{id}/focus", post(focus_task_route))
+        .route("/review", get(review_tasks))
+        .route("/focus", get(get_focused))
         .route("/search", get(search))
         // Mirror
         .route("/samples", get(list_samples).post(create_sample))
@@ -147,6 +154,120 @@ async fn get_ancestors(
         Ok(tasks) => Json(tasks).into_response(),
         Err(e) => {
             error!(id = %id, error = %e, "GET /tasks/:id/ancestors failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+// ── Defer & Review ──
+
+async fn defer_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    info!(id = %id, "POST /tasks/:id/defer");
+    match db::defer_task(&state.pool, &id).await {
+        Ok(task) => Json(task).into_response(),
+        Err(e) => {
+            error!(id = %id, error = %e, "POST /tasks/:id/defer failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn snooze_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    info!(id = %id, "POST /tasks/:id/snooze");
+    match db::snooze_review(&state.pool, &id).await {
+        Ok(task) => Json(task).into_response(),
+        Err(e) => {
+            error!(id = %id, error = %e, "POST /tasks/:id/snooze failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn review_tasks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    info!("GET /review");
+    match db::get_review_tasks(&state.pool).await {
+        Ok(tasks) => Json(tasks).into_response(),
+        Err(e) => {
+            error!(error = %e, "GET /review failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+// ── Touch ──
+
+#[derive(Deserialize, Default)]
+struct TouchBody {
+    response: Option<String>,
+}
+
+async fn touch_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<TouchBody>>,
+) -> impl IntoResponse {
+    info!(id = %id, "POST /tasks/:id/touch");
+    let response = body.and_then(|b| b.response.clone());
+    match db::touch_task(&state.pool, &id, response.as_deref()).await {
+        Ok(task) => Json(task).into_response(),
+        Err(e) => {
+            error!(id = %id, error = %e, "POST /tasks/:id/touch failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+// ── Inbox / Acknowledge ──
+
+async fn ack_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    info!(id = %id, "POST /tasks/:id/ack");
+    match db::acknowledge_task(&state.pool, &id).await {
+        Ok(task) => Json(task).into_response(),
+        Err(e) => {
+            error!(id = %id, error = %e, "POST /tasks/:id/ack failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+// ── Focus ──
+
+#[derive(Deserialize, Default)]
+struct FocusBody {
+    budget_minutes: Option<i64>,
+}
+
+async fn focus_task_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<FocusBody>>,
+) -> impl IntoResponse {
+    info!(id = %id, "POST /tasks/:id/focus");
+    let budget = body.and_then(|b| b.budget_minutes);
+    match db::focus_task(&state.pool, &id, budget).await {
+        Ok(task) => Json(task).into_response(),
+        Err(e) => {
+            error!(id = %id, error = %e, "POST /tasks/:id/focus failed");
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn get_focused(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    info!("GET /focus");
+    match db::get_focused_tasks(&state.pool).await {
+        Ok(tasks) => Json(tasks).into_response(),
+        Err(e) => {
+            error!(error = %e, "GET /focus failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }

@@ -17,6 +17,7 @@ use ratatui::{
 };
 use std::collections::HashSet;
 use std::io;
+use std::time::Duration;
 
 use crate::client::FloClient;
 use crate::models::{CreateTask, SearchResult, Task, UpdateTask};
@@ -219,6 +220,7 @@ enum UndoAction {
         completed: bool,
         position: i64,
         parent_id: Option<String>,
+        deferred: bool,
     },
 }
 
@@ -240,6 +242,7 @@ struct App {
     show_notes: bool,
     pending_counts: std::collections::HashMap<String, i64>,
     show_completed: bool,
+    show_deferred: bool,
     show_tree: bool,
     tree_items: Vec<(Task, usize)>,
     pending_key: PendingKey,
@@ -262,6 +265,8 @@ struct App {
     list_area: Rect,
     notes_area: Rect,
     help_scroll: u16,
+    // Focus
+    focused_tasks: Vec<Task>,
 }
 
 impl App {
@@ -276,6 +281,7 @@ impl App {
             show_notes: true,
             pending_counts: std::collections::HashMap::new(),
             show_completed: false,
+            show_deferred: false,
             show_tree: false,
             tree_items: Vec::new(),
             pending_key: PendingKey::None,
@@ -297,6 +303,7 @@ impl App {
             list_area: Rect::default(),
             notes_area: Rect::default(),
             help_scroll: 0,
+            focused_tasks: Vec::new(),
         }
     }
 
@@ -398,6 +405,7 @@ impl App {
             completed: task.completed,
             position: task.position,
             parent_id: task.parent_id.clone(),
+            deferred: task.deferred,
         }
     }
 
@@ -433,7 +441,7 @@ impl App {
                     }
                     reverse_actions.push(UndoAction::Delete(new_task.id));
                 }
-                UndoAction::Update { id, title, notes, completed, position, parent_id } => {
+                UndoAction::Update { id, title, notes, completed, position, parent_id, deferred } => {
                     if let Ok(tw) = self.client.get_task(id).await {
                         reverse_actions.push(Self::snapshot_task(&tw.task));
                     }
@@ -443,6 +451,8 @@ impl App {
                         completed: Some(*completed),
                         position: Some(*position),
                         parent_id: Some(parent_id.clone().unwrap_or_default()),
+                        deferred: Some(*deferred),
+                        ..Default::default()
                     }).await?;
                 }
             }
@@ -510,6 +520,7 @@ impl App {
         self.children = all_children
             .into_iter()
             .filter(|t| self.show_completed || !t.completed)
+            .filter(|t| self.show_deferred || !t.deferred)
             .filter(|t| {
                 self.filter.is_empty()
                     || t.title.to_lowercase().contains(&self.filter.to_lowercase())
@@ -547,6 +558,7 @@ impl App {
                     };
                     depth_map.insert(task.id.clone(), depth);
                     if (!self.show_completed && task.completed)
+                        || (!self.show_deferred && task.deferred)
                         || (!self.filter.is_empty()
                             && !task.title.to_lowercase().contains(&self.filter.to_lowercase()))
                     {
@@ -556,6 +568,9 @@ impl App {
                 }
             }
         }
+
+        // Refresh focused tasks
+        self.focused_tasks = self.client.get_focused_tasks().await.unwrap_or_default();
 
         Ok(())
     }
@@ -570,6 +585,10 @@ impl App {
 
     async fn enter_selected(&mut self) -> Result<()> {
         if let Some(task) = self.selected_task().cloned() {
+            // Auto-acknowledge on enter
+            if !task.acknowledged {
+                let _ = self.client.acknowledge_task(&task.id).await;
+            }
             if self.show_tree {
                 let ancestors = self.client.get_ancestors(&task.id).await?;
                 self.nav_stack.clear();
@@ -771,6 +790,59 @@ impl App {
         });
         self.status_msg = Some(format!("Toggled {} tasks", count));
         self.refresh_keep_selection().await?;
+        Ok(())
+    }
+
+    async fn defer_selected(&mut self) -> Result<()> {
+        if let Some(task) = self.selected_task().cloned() {
+            let updated = self.client.defer_task(&task.id).await?;
+            if updated.deferred {
+                self.status_msg = Some(format!("Deferred: {} (review in {}d)", updated.title, updated.review_interval));
+                if !self.show_deferred {
+                    let old_idx = self.list_state.selected();
+                    self.refresh().await?;
+                    let len = self.visible_count();
+                    if len == 0 {
+                        self.list_state.select(None);
+                    } else if let Some(idx) = old_idx {
+                        self.list_state.select(Some(idx.min(len - 1)));
+                    }
+                } else {
+                    self.refresh_keep_selection().await?;
+                }
+            } else {
+                self.status_msg = Some(format!("Undeferred: {}", updated.title));
+                self.refresh_keep_selection().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn touch_selected(&mut self) -> Result<()> {
+        if let Some(task) = self.selected_task().cloned() {
+            let _ = self.client.touch_task(&task.id, None).await?;
+            self.status_msg = Some(format!("Touched: {}", task.title));
+            self.refresh_keep_selection().await?;
+        }
+        Ok(())
+    }
+
+    async fn focus_selected(&mut self) -> Result<()> {
+        if let Some(task) = self.selected_task().cloned() {
+            match self.client.focus_task(&task.id, None).await {
+                Ok(updated) => {
+                    if updated.focused {
+                        self.status_msg = Some(format!("Focused: {}", updated.title));
+                    } else {
+                        self.status_msg = Some(format!("Unfocused: {}", updated.title));
+                    }
+                    self.refresh_keep_selection().await?;
+                }
+                Err(e) => {
+                    self.status_msg = Some(format!("{}", e));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1139,252 +1211,273 @@ async fn run_loop(
             ui(f, app);
         })?;
 
-        match event::read()? {
-            Event::Key(key) => {
-                if app.show_help {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?') => {
-                            app.show_help = false;
-                            app.help_scroll = 0;
+        // Poll with 1-second timeout so budget countdowns update
+        if event::poll(Duration::from_secs(1))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if app.show_help {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?') => {
+                                app.show_help = false;
+                                app.help_scroll = 0;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                app.help_scroll += 1;
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                app.help_scroll = app.help_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.help_scroll += 10;
+                            }
+                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.help_scroll = app.help_scroll.saturating_sub(10);
+                            }
+                            KeyCode::Char('g') => app.help_scroll = 0,
+                            KeyCode::Char('G') => app.help_scroll = 100, // will be clamped
+                            _ => {}
                         }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            app.help_scroll += 1;
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            app.help_scroll = app.help_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.help_scroll += 10;
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.help_scroll = app.help_scroll.saturating_sub(10);
-                        }
-                        KeyCode::Char('g') => app.help_scroll = 0,
-                        KeyCode::Char('G') => app.help_scroll = 100, // will be clamped
-                        _ => {}
+                        continue;
                     }
-                    continue;
-                }
 
-                match &mut app.input_mode {
-                    InputMode::Normal => {
-                        if handle_normal_key(app, key).await? {
-                            return Ok(());
+                    match &mut app.input_mode {
+                        InputMode::Normal => {
+                            if handle_normal_key(app, key).await? {
+                                return Ok(());
+                            }
                         }
-                    }
-                    InputMode::Adding(ref mut input) => {
-                        match key.code {
-                            KeyCode::Enter => {
-                                let is_push = app.adding_is_push;
-                                let is_append = app.adding_is_append;
-                                if let InputMode::Adding(input) =
-                                    std::mem::replace(&mut app.input_mode, InputMode::Normal)
-                                {
-                                    let text = input.into_string();
-                                    if !text.trim().is_empty() {
-                                        if is_push {
-                                            app.push_task(text.trim()).await?;
-                                        } else if is_append {
-                                            app.append_task(text.trim()).await?;
-                                        } else {
-                                            app.insert_task(text.trim()).await?;
+                        InputMode::Adding(ref mut input) => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    let is_push = app.adding_is_push;
+                                    let is_append = app.adding_is_append;
+                                    if let InputMode::Adding(input) =
+                                        std::mem::replace(&mut app.input_mode, InputMode::Normal)
+                                    {
+                                        let text = input.into_string();
+                                        if !text.trim().is_empty() {
+                                            if is_push {
+                                                app.push_task(text.trim()).await?;
+                                            } else if is_append {
+                                                app.append_task(text.trim()).await?;
+                                            } else {
+                                                app.insert_task(text.trim()).await?;
+                                            }
+                                        }
+                                    }
+                                    app.adding_is_push = false;
+                                    app.adding_is_append = false;
+                                }
+                                KeyCode::Esc => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.adding_is_push = false;
+                                    app.adding_is_append = false;
+                                }
+                                _ => handle_text_input(key, input),
+                            }
+                        }
+                        InputMode::Editing(ref mut input) => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if let InputMode::Editing(input) =
+                                        std::mem::replace(&mut app.input_mode, InputMode::Normal)
+                                    {
+                                        let text = input.into_string();
+                                        if !text.trim().is_empty() {
+                                            app.rename_selected(text.trim()).await?;
                                         }
                                     }
                                 }
-                                app.adding_is_push = false;
-                                app.adding_is_append = false;
-                            }
-                            KeyCode::Esc => {
-                                app.input_mode = InputMode::Normal;
-                                app.adding_is_push = false;
-                                app.adding_is_append = false;
-                            }
-                            _ => handle_text_input(key, input),
-                        }
-                    }
-                    InputMode::Editing(ref mut input) => {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if let InputMode::Editing(input) =
-                                    std::mem::replace(&mut app.input_mode, InputMode::Normal)
-                                {
-                                    let text = input.into_string();
-                                    if !text.trim().is_empty() {
-                                        app.rename_selected(text.trim()).await?;
-                                    }
+                                KeyCode::Esc => {
+                                    app.input_mode = InputMode::Normal;
                                 }
-                            }
-                            KeyCode::Esc => {
-                                app.input_mode = InputMode::Normal;
-                            }
-                            _ => handle_text_input(key, input),
-                        }
-                    }
-                    InputMode::Filtering(ref mut input) => {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.filter.clear();
-                                app.input_mode = InputMode::Normal;
-                                app.refresh_keep_selection().await?;
-                            }
-                            KeyCode::Enter => {
-                                if let InputMode::Filtering(input) =
-                                    std::mem::replace(&mut app.input_mode, InputMode::Normal)
-                                {
-                                    app.filter = input.into_string();
-                                    app.refresh().await?;
-                                    app.list_state.select(
-                                        if app.visible_count() > 0 { Some(0) } else { None }
-                                    );
-                                }
-                            }
-                            _ => {
-                                let old = input.as_str().to_string();
-                                handle_text_input(key, input);
-                                if old != input.as_str() {
-                                    app.filter = input.as_str().to_string();
-                                    app.refresh().await?;
-                                    app.list_state.select(
-                                        if app.visible_count() > 0 { Some(0) } else { None }
-                                    );
-                                }
+                                _ => handle_text_input(key, input),
                             }
                         }
-                    }
-                    InputMode::Searching(ref mut input) => {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.search_results.clear();
-                                app.input_mode = InputMode::Normal;
-                            }
-                            KeyCode::Enter => {
-                                if let Some(sel) = app.search_list_state.selected() {
-                                    if let Some(result) = app.search_results.get(sel) {
-                                        let task_id = result.task.id.clone();
-                                        let ancestors = app.client.get_ancestors(&task_id).await?;
-                                        app.nav_stack.clear();
-                                        for ancestor in &ancestors {
-                                            app.nav_stack.push((
-                                                ancestor.id.clone(),
-                                                ancestor.title.clone(),
-                                            ));
-                                        }
-                                        app.search_results.clear();
-                                        app.input_mode = InputMode::Normal;
+                        InputMode::Filtering(ref mut input) => {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.filter.clear();
+                                    app.input_mode = InputMode::Normal;
+                                    app.refresh_keep_selection().await?;
+                                }
+                                KeyCode::Enter => {
+                                    if let InputMode::Filtering(input) =
+                                        std::mem::replace(&mut app.input_mode, InputMode::Normal)
+                                    {
+                                        app.filter = input.into_string();
                                         app.refresh().await?;
-                                        // Land on the actual found task
-                                        app.select_by_id(&task_id);
+                                        app.list_state.select(
+                                            if app.visible_count() > 0 { Some(0) } else { None }
+                                        );
                                     }
                                 }
-                            }
-                            KeyCode::Down | KeyCode::Tab => {
-                                if let Some(sel) = app.search_list_state.selected() {
-                                    if sel + 1 < app.search_results.len() {
-                                        app.search_list_state.select(Some(sel + 1));
+                                _ => {
+                                    let old = input.as_str().to_string();
+                                    handle_text_input(key, input);
+                                    if old != input.as_str() {
+                                        app.filter = input.as_str().to_string();
+                                        app.refresh().await?;
+                                        app.list_state.select(
+                                            if app.visible_count() > 0 { Some(0) } else { None }
+                                        );
                                     }
-                                }
-                            }
-                            KeyCode::Up | KeyCode::BackTab => {
-                                if let Some(sel) = app.search_list_state.selected() {
-                                    if sel > 0 {
-                                        app.search_list_state.select(Some(sel - 1));
-                                    }
-                                }
-                            }
-                            _ => {
-                                let old = input.as_str().to_string();
-                                handle_text_input(key, input);
-                                if old != input.as_str() {
-                                    let q = input.as_str().to_string();
-                                    do_search(app, &q).await?;
                                 }
                             }
                         }
-                    }
-                    InputMode::ConfirmDelete(ref id, ref title) => {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                let id = id.clone();
-                                let title = title.clone();
-                                let old_idx = app.list_state.selected();
-                                app.client.delete_task(&id).await?;
-                                app.status_msg = Some(format!("Deleted: {}", title));
-                                app.input_mode = InputMode::Normal;
-                                app.refresh().await?;
-                                let len = app.visible_count();
-                                if len == 0 {
-                                    app.list_state.select(None);
-                                } else if let Some(idx) = old_idx {
-                                    app.list_state.select(Some(idx.min(len - 1)));
+                        InputMode::Searching(ref mut input) => {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.search_results.clear();
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(sel) = app.search_list_state.selected() {
+                                        if let Some(result) = app.search_results.get(sel) {
+                                            let task_id = result.task.id.clone();
+                                            let ancestors = app.client.get_ancestors(&task_id).await?;
+                                            app.nav_stack.clear();
+                                            for ancestor in &ancestors {
+                                                app.nav_stack.push((
+                                                    ancestor.id.clone(),
+                                                    ancestor.title.clone(),
+                                                ));
+                                            }
+                                            app.search_results.clear();
+                                            app.input_mode = InputMode::Normal;
+                                            app.refresh().await?;
+                                            // Land on the actual found task
+                                            app.select_by_id(&task_id);
+                                        }
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Tab => {
+                                    if let Some(sel) = app.search_list_state.selected() {
+                                        if sel + 1 < app.search_results.len() {
+                                            app.search_list_state.select(Some(sel + 1));
+                                        }
+                                    }
+                                }
+                                KeyCode::Up | KeyCode::BackTab => {
+                                    if let Some(sel) = app.search_list_state.selected() {
+                                        if sel > 0 {
+                                            app.search_list_state.select(Some(sel - 1));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    let old = input.as_str().to_string();
+                                    handle_text_input(key, input);
+                                    if old != input.as_str() {
+                                        let q = input.as_str().to_string();
+                                        do_search(app, &q).await?;
+                                    }
                                 }
                             }
-                            _ => {
-                                app.status_msg = None;
-                                app.input_mode = InputMode::Normal;
+                        }
+                        InputMode::ConfirmDelete(ref id, ref title) => {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    let id = id.clone();
+                                    let title = title.clone();
+                                    let old_idx = app.list_state.selected();
+                                    app.client.delete_task(&id).await?;
+                                    app.status_msg = Some(format!("Deleted: {}", title));
+                                    app.input_mode = InputMode::Normal;
+                                    app.refresh().await?;
+                                    let len = app.visible_count();
+                                    if len == 0 {
+                                        app.list_state.select(None);
+                                    } else if let Some(idx) = old_idx {
+                                        app.list_state.select(Some(idx.min(len - 1)));
+                                    }
+                                }
+                                _ => {
+                                    app.status_msg = None;
+                                    app.input_mode = InputMode::Normal;
+                                }
                             }
                         }
+                        InputMode::WantEditorForNotes => {}
                     }
-                    InputMode::WantEditorForNotes => {}
                 }
-            }
-            Event::Mouse(mouse) => {
-                if app.show_help {
+                Event::Mouse(mouse) => {
+                    if app.show_help {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.help_scroll = app.help_scroll.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.help_scroll += 3;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if !matches!(app.input_mode, InputMode::Normal) { continue; }
+
                     match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let row = mouse.row;
+                            let col = mouse.column;
+                            // Click in task list area
+                            if row >= app.list_area.y
+                                && row < app.list_area.y + app.list_area.height
+                                && col >= app.list_area.x
+                                && col < app.list_area.x + app.list_area.width
+                            {
+                                let clicked_row = (row - app.list_area.y) as usize;
+                                let offset = app.list_state.offset();
+                                let clicked_index = offset + clicked_row;
+                                if clicked_index < app.visible_count() {
+                                    app.notes_scroll = 0;
+                                    app.list_state.select(Some(clicked_index));
+                                }
+                            }
+                        }
                         MouseEventKind::ScrollUp => {
-                            app.help_scroll = app.help_scroll.saturating_sub(3);
+                            if mouse.column >= app.notes_area.x
+                                && app.notes_area.width > 0
+                                && app.show_notes
+                            {
+                                app.notes_scroll = app.notes_scroll.saturating_sub(3);
+                            } else {
+                                app.move_up();
+                            }
                         }
                         MouseEventKind::ScrollDown => {
-                            app.help_scroll += 3;
+                            if mouse.column >= app.notes_area.x
+                                && app.notes_area.width > 0
+                                && app.show_notes
+                            {
+                                app.notes_scroll += 3;
+                            } else {
+                                app.move_down();
+                            }
                         }
                         _ => {}
                     }
-                    continue;
                 }
-                if !matches!(app.input_mode, InputMode::Normal) { continue; }
+                _ => {}
+            }
+        } else {
+            // Timeout — check for budget expiry alerts
+            check_budget_alerts(app);
+        }
+    }
+}
 
-                match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let row = mouse.row;
-                        let col = mouse.column;
-                        // Click in task list area
-                        if row >= app.list_area.y
-                            && row < app.list_area.y + app.list_area.height
-                            && col >= app.list_area.x
-                            && col < app.list_area.x + app.list_area.width
-                        {
-                            let clicked_row = (row - app.list_area.y) as usize;
-                            let offset = app.list_state.offset();
-                            let clicked_index = offset + clicked_row;
-                            if clicked_index < app.visible_count() {
-                                app.notes_scroll = 0;
-                                app.list_state.select(Some(clicked_index));
-                            }
-                        }
-                    }
-                    MouseEventKind::ScrollUp => {
-                        if mouse.column >= app.notes_area.x
-                            && app.notes_area.width > 0
-                            && app.show_notes
-                        {
-                            app.notes_scroll = app.notes_scroll.saturating_sub(3);
-                        } else {
-                            app.move_up();
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if mouse.column >= app.notes_area.x
-                            && app.notes_area.width > 0
-                            && app.show_notes
-                        {
-                            app.notes_scroll += 3;
-                        } else {
-                            app.move_down();
-                        }
-                    }
-                    _ => {}
+fn check_budget_alerts(app: &mut App) {
+    for task in &app.focused_tasks {
+        if let (Some(ref focused_at), Some(budget)) = (&task.focused_at, task.budget_minutes) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(focused_at) {
+                let elapsed = chrono::Utc::now().signed_duration_since(dt).num_minutes();
+                let remaining = budget - elapsed;
+                // Alert when budget just expired (within 1 minute window)
+                if (-1..=0).contains(&remaining) {
+                    app.status_msg = Some(format!("BUDGET EXPIRED: {}", task.title));
                 }
             }
-            _ => {}
         }
     }
 }
@@ -1577,6 +1670,14 @@ async fn handle_normal_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.toggle_done().await?;
             }
         }
+        KeyCode::Char('z') => app.defer_selected().await?,
+        KeyCode::Char('.') => app.touch_selected().await?,
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.search_results.clear();
+            app.search_list_state.select(None);
+            app.input_mode = InputMode::Searching(TextInput::empty());
+        }
+        KeyCode::Char('f') => app.focus_selected().await?,
         KeyCode::Char('d') => {
             app.pending_key = PendingKey::D;
         }
@@ -1649,11 +1750,6 @@ async fn handle_normal_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('/') => {
             app.input_mode = InputMode::Filtering(TextInput::new(app.filter.clone()));
         }
-        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.search_results.clear();
-            app.search_list_state.select(None);
-            app.input_mode = InputMode::Searching(TextInput::empty());
-        }
         KeyCode::Esc => {
             if !app.selected_ids.is_empty() {
                 let count = app.selected_ids.len();
@@ -1674,6 +1770,12 @@ async fn handle_normal_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('c') => {
             app.show_completed = !app.show_completed;
+            app.save_selection();
+            app.refresh().await?;
+            app.restore_selection();
+        }
+        KeyCode::Char('Z') => {
+            app.show_deferred = !app.show_deferred;
             app.save_selection();
             app.refresh().await?;
             app.restore_selection();
@@ -1726,12 +1828,15 @@ fn render_input_line(label: &str, input: &TextInput, color: Color) -> Line<'stat
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
+    let focus_height = if app.focused_tasks.is_empty() { 0 } else { app.focused_tasks.len() as u16 + 1 };
+
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // breadcrumb
-            Constraint::Min(3),   // content
-            Constraint::Length(1), // status
+            Constraint::Length(1),             // breadcrumb
+            Constraint::Length(focus_height),   // focus header (0 if none)
+            Constraint::Min(3),                // content
+            Constraint::Length(2),              // status
         ])
         .split(area);
 
@@ -1759,6 +1864,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.show_completed {
         bc_spans.push(Span::styled("  [+done]", Style::default().fg(Color::Yellow)));
     }
+    if app.show_deferred {
+        bc_spans.push(Span::styled("  [+deferred]", Style::default().fg(Color::Yellow)));
+    }
     if !app.selected_ids.is_empty() {
         bc_spans.push(Span::styled(
             format!("  [{} sel]", app.selected_ids.len()),
@@ -1780,25 +1888,31 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(Paragraph::new(Line::from(bc_spans)), outer[0]);
 
+    // Focus header
+    if !app.focused_tasks.is_empty() {
+        render_focus_header(f, app, outer[1]);
+    }
+
     // Content
+    let content_area = outer[2];
     if app.show_notes {
         let content = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(outer[1]);
+            .split(content_area);
 
         app.list_area = content[0];
         app.notes_area = content[1];
         render_task_list(f, app, content[0]);
         render_notes_panel(f, app, content[1]);
     } else {
-        app.list_area = outer[1];
+        app.list_area = content_area;
         app.notes_area = Rect::default();
-        render_task_list(f, app, outer[1]);
+        render_task_list(f, app, content_area);
     }
 
     // Status bar
-    render_status_bar(f, app, outer[2]);
+    render_status_bar(f, app, outer[3]);
 
     // Overlays
     if matches!(app.input_mode, InputMode::Searching(_)) {
@@ -1807,6 +1921,46 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.show_help {
         render_help(f, area, app.help_scroll);
     }
+}
+
+fn render_focus_header(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Focus",
+        Style::default().fg(Color::Rgb(200, 150, 50)).add_modifier(Modifier::BOLD),
+    )));
+    for task in &app.focused_tasks {
+        let mut spans = vec![Span::raw("  ")];
+        spans.push(Span::styled(
+            &task.title,
+            Style::default().fg(Color::Rgb(200, 150, 50)),
+        ));
+        // Show elapsed / budget countdown
+        if let Some(ref focused_at) = task.focused_at {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(focused_at) {
+                let elapsed_mins = chrono::Utc::now().signed_duration_since(dt).num_minutes();
+                if let Some(budget) = task.budget_minutes {
+                    let remaining = budget - elapsed_mins;
+                    let (text, color) = if remaining > 10 {
+                        (format!("  ({}m left)", remaining), Color::Green)
+                    } else if remaining > 0 {
+                        (format!("  ({}m left)", remaining), Color::Yellow)
+                    } else {
+                        (format!("  (OVER {}m)", -remaining), Color::Red)
+                    };
+                    spans.push(Span::styled(text, Style::default().fg(color)));
+                } else {
+                    spans.push(Span::styled(
+                        format!("  ({}m)", elapsed_mins),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    let p = Paragraph::new(lines);
+    f.render_widget(p, area);
 }
 
 fn render_task_list(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1853,6 +2007,38 @@ fn render_task_list(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
+/// Compute staleness color from updated_at age.
+/// For focused tasks: warm amber gradient. For unfocused: gray gradient.
+fn staleness_color(updated_at: &str, focused: bool) -> Option<Color> {
+    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return None;
+    };
+    let age = chrono::Utc::now().signed_duration_since(updated);
+    let days = age.num_days();
+
+    if focused {
+        // Focused tasks use warm amber gradient
+        if days < 1 {
+            Some(Color::Rgb(200, 150, 50))  // warm amber
+        } else if days < 3 {
+            Some(Color::Rgb(220, 100, 30))  // warm orange
+        } else {
+            Some(Color::Rgb(200, 60, 20))   // warm red
+        }
+    } else {
+        // Unfocused tasks use gray dimming
+        if days < 3 {
+            None // fresh
+        } else if days < 7 {
+            Some(Color::Rgb(160, 160, 160)) // slightly dim
+        } else if days < 14 {
+            Some(Color::Rgb(120, 120, 120)) // dimmer
+        } else {
+            Some(Color::Rgb(80, 80, 80)) // very dim
+        }
+    }
+}
+
 fn build_task_line(
     task: &Task,
     depth: usize,
@@ -1860,9 +2046,24 @@ fn build_task_line(
     is_selected: bool,
 ) -> ListItem<'static> {
     let indent = "  ".repeat(depth);
-    let check = if task.completed { "x" } else { " " };
+
+    // Checkbox: [x] done, [?] unacked, [F] focused, [ ] normal
+    let check = if task.completed {
+        "x"
+    } else if !task.acknowledged {
+        "?"
+    } else {
+        " "
+    };
 
     let select_marker = if is_selected { "*" } else { " " };
+
+    // Staleness dimming for incomplete tasks
+    let stale_color = if !task.completed {
+        staleness_color(&task.updated_at, task.focused)
+    } else {
+        None
+    };
 
     let mut spans = vec![
         Span::styled(
@@ -1874,20 +2075,30 @@ fn build_task_line(
             },
         ),
         Span::raw(indent),
-        Span::styled(
-            format!("[{}] ", check),
-            if task.completed {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default().fg(Color::Green)
-            },
-        ),
     ];
 
+    // Checkbox styling
+    let check_style = if task.completed {
+        Style::default().fg(Color::DarkGray)
+    } else if !task.acknowledged {
+        // Unacked: dimmer style
+        Style::default().fg(Color::Rgb(120, 120, 120))
+    } else if let Some(color) = stale_color {
+        Style::default().fg(color)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    spans.push(Span::styled(format!("[{}] ", check), check_style));
+
+    // Title styling
     let title_style = if task.completed {
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::CROSSED_OUT)
+    } else if !task.acknowledged {
+        Style::default().fg(Color::Rgb(120, 120, 120))
+    } else if let Some(color) = stale_color {
+        Style::default().fg(color)
     } else {
         Style::default()
     };
@@ -1903,6 +2114,15 @@ fn build_task_line(
                 ));
             }
         }
+    }
+
+    // Indicators
+    if task.focused {
+        spans.push(Span::styled(" [F]", Style::default().fg(Color::Rgb(200, 150, 50))));
+    }
+
+    if task.deferred {
+        spans.push(Span::styled(" [zzz]", Style::default().fg(Color::DarkGray)));
     }
 
     if !task.notes.is_empty() {
@@ -2028,7 +2248,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::Yellow),
                 ))
             } else if let Some(msg) = &app.status_msg {
-                let color = if app.quit_pending { Color::Red } else { Color::Green };
+                let color = if app.quit_pending || msg.starts_with("BUDGET EXPIRED") {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
                 Line::from(Span::styled(
                     format!(" {}", msg),
                     Style::default().fg(color),
@@ -2036,40 +2260,22 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 let dim = Style::default().fg(Color::DarkGray);
                 let key_style = Style::default().fg(Color::Yellow);
-                let sep = Span::styled("  ", dim);
-                let mut spans = vec![Span::raw(" ")];
 
-                let keys: &[(&str, &str)] = &[
-                    ("a", "ins"),
-                    ("A", "append"),
-                    ("o", "push"),
-                    ("x", "done"),
-                    ("dd", "cut"),
-                    ("yy", "yank"),
-                    ("p", "paste"),
-                    ("J/K", "move"),
-                    ("Spc", "sel"),
-                    ("u", "undo"),
-                    ("?", "help"),
-                ];
-
-                for (i, (k, label)) in keys.iter().enumerate() {
-                    if i > 0 {
-                        spans.push(sep.clone());
-                    }
-                    spans.push(Span::styled(*k, key_style));
-                    spans.push(Span::styled(format!(":{}", label), dim));
+                let mut row1: Vec<Span> = vec![Span::raw(" ")];
+                for (i, (k, label)) in [("a", "ins"), ("A", "append"), ("o", "push"), ("x", "done"), ("dd", "cut"), ("yy", "yank"), ("p", "paste")].iter().enumerate() {
+                    if i > 0 { row1.push(Span::styled("  ", dim)); }
+                    row1.push(Span::styled(*k, key_style));
+                    row1.push(Span::styled(format!(":{}", label), dim));
                 }
-
                 match &app.clipboard {
                     Clipboard::Cut(t) => {
-                        spans.push(Span::styled(
+                        row1.push(Span::styled(
                             format!("  [cut: {}]", t.title),
                             Style::default().fg(Color::Yellow),
                         ));
                     }
                     Clipboard::Yank(_, t) => {
-                        spans.push(Span::styled(
+                        row1.push(Span::styled(
                             format!("  [yank: {}]", t),
                             Style::default().fg(Color::Cyan),
                         ));
@@ -2077,7 +2283,17 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     Clipboard::Empty => {}
                 }
 
-                Line::from(spans)
+                let mut row2: Vec<Span> = vec![Span::raw(" ")];
+                for (i, (k, label)) in [(".", "touch"), ("f", "focus"), ("z", "defer"), ("J/K", "move"), ("Spc", "sel"), ("u", "undo"), ("?", "help")].iter().enumerate() {
+                    if i > 0 { row2.push(Span::styled("  ", dim)); }
+                    row2.push(Span::styled(*k, key_style));
+                    row2.push(Span::styled(format!(":{}", label), dim));
+                }
+
+                return f.render_widget(
+                    Paragraph::new(vec![Line::from(row1), Line::from(row2)]),
+                    area,
+                );
             }
         }
     };
@@ -2189,7 +2405,7 @@ fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
             Span::styled(" Navigation", Style::default().fg(Color::Yellow)),
         ]),
         Line::from("   j/k ↑/↓     move selection (wraps)"),
-        Line::from("   Enter/l/→   enter task"),
+        Line::from("   Enter/l/→   enter task (auto-acks)"),
         Line::from("   h/←/Bksp    go to parent"),
         Line::from("   H/~         go to root"),
         Line::from("   gg          jump to first"),
@@ -2204,12 +2420,15 @@ fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
         Line::from("   o           push (insert + enter)"),
         Line::from("   e           edit title"),
         Line::from("   x           toggle done (bulk)"),
+        Line::from("   .           touch (update timestamp)"),
+        Line::from("   f           toggle focus (max 3)"),
         Line::from("   dd          cut task"),
         Line::from("   yy          yank (copy) task"),
         Line::from("   p           paste"),
         Line::from("   J/K         move task down/up"),
         Line::from("   >>          indent (child of above)"),
         Line::from("   <<          outdent (up a level)"),
+        Line::from("   z           defer/undefer task"),
         Line::from("   D           delete task"),
         Line::from("   n           edit notes ($EDITOR)"),
         Line::from("   u           undo"),
@@ -2229,6 +2448,7 @@ fn render_help(f: &mut Frame, area: Rect, scroll: u16) {
         Line::from("   [/]         scroll notes up/down"),
         Line::from("   t           toggle tree/list"),
         Line::from("   c           toggle completed"),
+        Line::from("   Z           toggle deferred"),
         Line::from("   /           filter (local)"),
         Line::from("   Ctrl-f      search (global)"),
         Line::from("   r           refresh"),

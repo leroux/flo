@@ -71,6 +71,29 @@ pub enum Command {
         #[arg(short, long)]
         under: Option<usize>,
     },
+    /// Defer a task (toggle). Deferred tasks are hidden from default view.
+    Defer {
+        /// Child index (1-based). Omit to defer current frame.
+        index: Option<usize>,
+    },
+    /// Review deferred tasks due for check-in
+    Review,
+    /// Touch a task (update timestamp + log sample)
+    Touch {
+        /// Child index (1-based). Omit to touch current frame.
+        index: Option<usize>,
+        /// Optional response text for the sample
+        #[arg(short, long)]
+        text: Option<String>,
+    },
+    /// Toggle focus on a task (max 3 WIP slots)
+    Focus {
+        /// Child index (1-based). Omit to show focused tasks.
+        index: Option<usize>,
+        /// Time budget in minutes for this focus session
+        #[arg(short, long)]
+        budget: Option<i64>,
+    },
     /// Log what you're doing right now
     Log {
         /// What are you doing?
@@ -233,6 +256,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             ensure_server(port).await?;
             cmd_indent(port, index, under).await
         }
+        Some(Command::Defer { index }) => {
+            ensure_server(port).await?;
+            cmd_defer(port, index).await
+        }
+        Some(Command::Review) => {
+            ensure_server(port).await?;
+            cmd_review(port).await
+        }
+        Some(Command::Touch { index, text }) => {
+            ensure_server(port).await?;
+            cmd_touch(port, index, text.as_deref()).await
+        }
+        Some(Command::Focus { index, budget }) => {
+            ensure_server(port).await?;
+            cmd_focus(port, index, budget).await
+        }
         // Mirror commands
         Some(Command::Log { text }) => {
             ensure_server(port).await?;
@@ -309,8 +348,21 @@ async fn cmd_status(port: u16) -> Result<()> {
                 println!("  (no children)");
             } else {
                 for (i, child) in tw.children.iter().enumerate() {
-                    let check = if child.completed { "x" } else { " " };
-                    println!("  {}. [{}] {}", i + 1, check, child.title);
+                    let check = if child.completed {
+                        "x"
+                    } else if !child.acknowledged {
+                        "?"
+                    } else {
+                        " "
+                    };
+                    let mut suffix = String::new();
+                    if child.focused {
+                        suffix.push_str(" [F]");
+                    }
+                    if child.deferred {
+                        suffix.push_str(" [zzz]");
+                    }
+                    println!("  {}. [{}] {}{}", i + 1, check, child.title, suffix);
                 }
             }
             Ok(())
@@ -366,6 +418,10 @@ async fn cmd_down(port: u16, index: usize) -> Result<()> {
     }
 
     let child = &children[index - 1];
+    // Auto-acknowledge on enter
+    if !child.acknowledged {
+        client.acknowledge_task(&child.id).await?;
+    }
     write_cursor(Some(&child.id));
     println!("Entered: {}", child.title);
     Ok(())
@@ -545,6 +601,177 @@ async fn cmd_indent(port: u16, index: usize, under: Option<usize>) -> Result<()>
     Ok(())
 }
 
+// ── Defer & Review ──
+
+async fn cmd_defer(port: u16, index: Option<usize>) -> Result<()> {
+    let client = FloClient::new(port);
+    let cursor = read_cursor();
+
+    let id = match index {
+        None => cursor.context("no current frame to defer (at root)")?,
+        Some(idx) => {
+            let children = client.list_tasks(cursor.as_deref()).await?;
+            if idx == 0 || idx > children.len() {
+                anyhow::bail!("invalid index {}. Have {} children.", idx, children.len());
+            }
+            children[idx - 1].id.clone()
+        }
+    };
+
+    let task = client.defer_task(&id).await?;
+    if task.deferred {
+        println!("Deferred: {} (review in {} days)", task.title, task.review_interval);
+    } else {
+        println!("Undeferred: {}", task.title);
+    }
+    Ok(())
+}
+
+async fn cmd_review(port: u16) -> Result<()> {
+    use std::io::{self, Write};
+
+    let client = FloClient::new(port);
+    let tasks = client.get_review_tasks().await?;
+
+    if tasks.is_empty() {
+        println!("Nothing to review. All caught up!");
+        return Ok(());
+    }
+
+    println!("Review ({} tasks due)", tasks.len());
+    println!("{}", "─".repeat(40));
+
+    for task in &tasks {
+        println!("\n  {} (interval: {}d)", task.title, task.review_interval);
+        if !task.notes.is_empty() {
+            for line in task.notes.lines().take(3) {
+                println!("    {}", line);
+            }
+        }
+        print!("  [k]eep  [s]nooze  [d]one  [q]uit > ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        match input.trim() {
+            "k" | "keep" => {
+                // Un-defer: bring it back to active
+                client.defer_task(&task.id).await?;
+                println!("  → Activated");
+            }
+            "s" | "snooze" => {
+                let updated = client.snooze_task(&task.id).await?;
+                println!("  → Snoozed (next review in {}d)", updated.review_interval);
+            }
+            "d" | "done" => {
+                client
+                    .update_task(
+                        &task.id,
+                        &UpdateTask {
+                            completed: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                println!("  → Done");
+            }
+            "q" | "quit" => {
+                println!("  → Stopped review");
+                break;
+            }
+            _ => {
+                println!("  → Skipped");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Touch ──
+
+async fn cmd_touch(port: u16, index: Option<usize>, text: Option<&str>) -> Result<()> {
+    let client = FloClient::new(port);
+    let cursor = read_cursor();
+
+    let id = match index {
+        None => cursor.context("no current frame to touch (at root)")?,
+        Some(idx) => {
+            let children = client.list_tasks(cursor.as_deref()).await?;
+            if idx == 0 || idx > children.len() {
+                anyhow::bail!("invalid index {}. Have {} children.", idx, children.len());
+            }
+            children[idx - 1].id.clone()
+        }
+    };
+
+    let task = client.touch_task(&id, text).await?;
+    println!("Touched: {}", task.title);
+    Ok(())
+}
+
+// ── Focus ──
+
+async fn cmd_focus(port: u16, index: Option<usize>, budget: Option<i64>) -> Result<()> {
+    let client = FloClient::new(port);
+
+    match index {
+        None => {
+            // Show focused tasks
+            let tasks = client.get_focused_tasks().await?;
+            if tasks.is_empty() {
+                println!("No focused tasks. Use `flo focus N` to focus a task.");
+                return Ok(());
+            }
+            println!("Focused tasks");
+            println!("{}", "─".repeat(40));
+            for (i, task) in tasks.iter().enumerate() {
+                let elapsed = if let Some(ref at) = task.focused_at {
+                    format_elapsed(at)
+                } else {
+                    String::new()
+                };
+                let budget_str = if let Some(mins) = task.budget_minutes {
+                    format!(" (budget: {}m)", mins)
+                } else {
+                    String::new()
+                };
+                println!("  {}. {}{} {}", i + 1, task.title, budget_str, elapsed);
+            }
+            Ok(())
+        }
+        Some(idx) => {
+            let cursor = read_cursor();
+            let children = client.list_tasks(cursor.as_deref()).await?;
+            if idx == 0 || idx > children.len() {
+                anyhow::bail!("invalid index {}. Have {} children.", idx, children.len());
+            }
+            let id = &children[idx - 1].id;
+            let task = client.focus_task(id, budget).await?;
+            if task.focused {
+                let budget_str = budget.map(|m| format!(" ({}m budget)", m)).unwrap_or_default();
+                println!("Focused: {}{}", task.title, budget_str);
+            } else {
+                println!("Unfocused: {}", task.title);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn format_elapsed(iso: &str) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) else {
+        return String::new();
+    };
+    let elapsed = chrono::Utc::now().signed_duration_since(dt);
+    let mins = elapsed.num_minutes();
+    if mins < 60 {
+        format!("({}m ago)", mins)
+    } else {
+        let hours = mins / 60;
+        format!("({}h{}m ago)", hours, mins % 60)
+    }
+}
+
 // ── Mirror ──
 
 async fn cmd_log(port: u16, text: &str) -> Result<()> {
@@ -553,6 +780,7 @@ async fn cmd_log(port: u16, text: &str) -> Result<()> {
         .create_sample(&crate::models::CreateSample {
             response: text.to_string(),
             prompt_type: "activity".to_string(),
+            task_id: None,
         })
         .await?;
     println!("Logged at {}", &sample.created_at[11..16]);
@@ -579,6 +807,7 @@ async fn cmd_ping(port: u16) -> Result<()> {
         .create_sample(&crate::models::CreateSample {
             response: response.to_string(),
             prompt_type: "ping".to_string(),
+            task_id: None,
         })
         .await?;
     println!("Recorded at {}", &sample.created_at[11..16]);
@@ -601,9 +830,22 @@ async fn cmd_mirror(port: u16) -> Result<()> {
         let tag = match s.prompt_type.as_str() {
             "ping" => "ping",
             "activity" => " log",
+            "touch" => "touch",
             other => other,
         };
-        println!("  {} [{}] {}", time, tag, s.response);
+        let task_label = s.task_id.as_ref().map(|_| {
+            // For touch samples, response is the task title
+            if s.prompt_type == "touch" {
+                format!(" {}", s.response)
+            } else {
+                String::new()
+            }
+        }).unwrap_or_default();
+        if s.prompt_type == "touch" {
+            println!("  {} [{}]{}", time, tag, task_label);
+        } else {
+            println!("  {} [{}] {}", time, tag, s.response);
+        }
     }
     println!("\n{} entries", samples.len());
     Ok(())

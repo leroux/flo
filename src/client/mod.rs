@@ -115,6 +115,87 @@ impl FloClient {
         Ok(resp.json().await?)
     }
 
+    // ── Defer & Review ──
+
+    pub async fn defer_task(&self, id: &str) -> Result<Task> {
+        let resp = self
+            .http
+            .post(format!("{}/api/tasks/{}/defer", self.base_url, id))
+            .send()
+            .await
+            .context("failed to connect to server")?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn snooze_task(&self, id: &str) -> Result<Task> {
+        let resp = self
+            .http
+            .post(format!("{}/api/tasks/{}/snooze", self.base_url, id))
+            .send()
+            .await
+            .context("failed to connect to server")?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_review_tasks(&self) -> Result<Vec<Task>> {
+        let resp = self
+            .http
+            .get(format!("{}/api/review", self.base_url))
+            .send()
+            .await
+            .context("failed to connect to server")?;
+        Ok(resp.json().await?)
+    }
+
+    // ── Touch ──
+
+    pub async fn touch_task(&self, id: &str, response: Option<&str>) -> Result<Task> {
+        let mut req = self.http.post(format!("{}/api/tasks/{}/touch", self.base_url, id));
+        if let Some(text) = response {
+            req = req.json(&serde_json::json!({ "response": text }));
+        }
+        let resp = req.send().await.context("failed to connect to server")?;
+        Ok(resp.json().await?)
+    }
+
+    // ── Inbox / Acknowledge ──
+
+    pub async fn acknowledge_task(&self, id: &str) -> Result<Task> {
+        let resp = self
+            .http
+            .post(format!("{}/api/tasks/{}/ack", self.base_url, id))
+            .send()
+            .await
+            .context("failed to connect to server")?;
+        Ok(resp.json().await?)
+    }
+
+    // ── Focus ──
+
+    pub async fn focus_task(&self, id: &str, budget_minutes: Option<i64>) -> Result<Task> {
+        let mut req = self.http.post(format!("{}/api/tasks/{}/focus", self.base_url, id));
+        if let Some(mins) = budget_minutes {
+            req = req.json(&serde_json::json!({ "budget_minutes": mins }));
+        }
+        let resp = req.send().await.context("failed to connect to server")?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("{}", body);
+        }
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    pub async fn get_focused_tasks(&self) -> Result<Vec<Task>> {
+        let resp = self
+            .http
+            .get(format!("{}/api/focus", self.base_url))
+            .send()
+            .await
+            .context("failed to connect to server")?;
+        Ok(resp.json().await?)
+    }
+
     // ── Search ──
 
     pub async fn search(&self, query: &str) -> Result<Vec<crate::models::SearchResult>> {
