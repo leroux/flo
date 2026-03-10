@@ -25,6 +25,16 @@ impl FloClient {
         Ok(resp.is_ok())
     }
 
+    pub async fn health_version(&self) -> Result<Option<String>> {
+        let resp = self
+            .http
+            .get(format!("{}/api/health", self.base_url))
+            .send()
+            .await?;
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body.get("version").and_then(|v| v.as_str()).map(String::from))
+    }
+
     pub async fn home(&self) -> Result<Vec<ProjectPreview>> {
         let resp = self
             .http

@@ -1,12 +1,17 @@
 mod cli;
 mod client;
 mod db;
+mod logging;
 mod models;
 mod server;
 #[cfg(feature = "tui")]
 mod tui;
 
 use clap::Parser;
+
+pub fn version() -> String {
+    flo::version()
+}
 
 #[tokio::main]
 async fn main() {

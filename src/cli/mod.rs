@@ -63,6 +63,14 @@ pub enum Command {
     Delete {
         index: usize,
     },
+    /// Make a child a subtask of a sibling (indent)
+    Indent {
+        /// Child index to indent (1-based)
+        index: usize,
+        /// Target parent index (1-based). Defaults to sibling above.
+        #[arg(short, long)]
+        under: Option<usize>,
+    },
     /// Log what you're doing right now
     Log {
         /// What are you doing?
@@ -106,8 +114,25 @@ fn write_cursor(id: Option<&str>) {
 
 pub async fn ensure_server(port: u16) -> Result<()> {
     let client = FloClient::new(port);
+    let expected_version = crate::version();
+
+    // Check if a server is already running
     if client.health().await.unwrap_or(false) {
-        return Ok(());
+        // Verify it's the right version
+        let remote_version = client.health_version().await.ok().flatten();
+        match remote_version {
+            Some(v) if v == expected_version => return Ok(()),
+            Some(v) => {
+                eprintln!("stale server detected (running {}, expected {}), restarting...", v, expected_version);
+                kill_server();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            None => {
+                eprintln!("unknown server on port {}, restarting...", port);
+                kill_server();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
     }
 
     // Auto-start server as background daemon
@@ -135,12 +160,23 @@ pub async fn ensure_server(port: u16) -> Result<()> {
     anyhow::bail!("server failed to start within 5 seconds")
 }
 
+fn kill_server() {
+    let pid_path = data_dir().join("server.pid");
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGTERM); }
+        }
+    }
+    std::fs::remove_file(&pid_path).ok();
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     let port = cli.port;
 
     match cli.command {
         None => cmd_home(port).await,
         Some(Command::Server) => {
+            let _log_guard = crate::logging::init();
             let db_path = data_dir().join("flo.db");
             std::fs::create_dir_all(data_dir())?;
             let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
@@ -192,6 +228,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Delete { index }) => {
             ensure_server(port).await?;
             cmd_delete(port, index).await
+        }
+        Some(Command::Indent { index, under }) => {
+            ensure_server(port).await?;
+            cmd_indent(port, index, under).await
         }
         // Mirror commands
         Some(Command::Log { text }) => {
@@ -463,6 +503,45 @@ async fn cmd_delete(port: u16, index: usize) -> Result<()> {
     let title = child.title.clone();
     client.delete_task(&child.id).await?;
     println!("Deleted: {}", title);
+    Ok(())
+}
+
+async fn cmd_indent(port: u16, index: usize, under: Option<usize>) -> Result<()> {
+    let client = FloClient::new(port);
+    let cursor = read_cursor();
+    let children = client.list_tasks(cursor.as_deref()).await?;
+
+    if index == 0 || index > children.len() {
+        anyhow::bail!("invalid index {}. Have {} children.", index, children.len());
+    }
+
+    let target_index = match under {
+        Some(t) => t,
+        None => {
+            if index <= 1 {
+                anyhow::bail!("no sibling above index 1 to indent under. Use --under to specify.");
+            }
+            index - 1
+        }
+    };
+
+    if target_index == 0 || target_index > children.len() {
+        anyhow::bail!("invalid target index {}. Have {} children.", target_index, children.len());
+    }
+    if target_index == index {
+        anyhow::bail!("cannot indent a task under itself.");
+    }
+
+    let child = &children[index - 1];
+    let new_parent = &children[target_index - 1];
+
+    let task = client
+        .update_task(&child.id, &UpdateTask {
+            parent_id: Some(new_parent.id.clone()),
+            ..Default::default()
+        })
+        .await?;
+    println!("Moved \"{}\" under \"{}\"", task.title, new_parent.title);
     Ok(())
 }
 
